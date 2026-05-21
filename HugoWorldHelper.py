@@ -2,10 +2,10 @@ import discord
 from discord.ext import commands
 import aiohttp
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 # ============================================================
-#  CONFIG – nur über Umgebungsvariablen (Railway)
+#  CONFIG – Umgebungsvariablen (Railway)
 # ============================================================
 
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
@@ -14,15 +14,12 @@ FREE_MESSAGE   = os.environ.get("FREE_MESSAGE", "📁 Hier sind deine Dateien!")
 ALLOWED_ROLES  = [r.strip() for r in os.environ.get("ALLOWED_ROLES", "").split(",") if r.strip()]
 FILES_TO_SEND  = [f.strip() for f in os.environ.get("FILES_TO_SEND", "").split(",") if f.strip()]
 
-# !buy spezifisch
 BUY_TICKET_KEYWORD      = os.environ.get("BUY_TICKET_KEYWORD", "buy")
 TARGET_MINECRAFT_PLAYER = os.environ.get("TARGET_MINECRAFT_PLAYER", "")
 LOG_CHANNEL_ID          = int(os.environ.get("LOG_CHANNEL_ID", "0"))
+API_URL                 = os.environ.get("API_URL", "https://hugoworldhelperapi.onrender.com").rstrip("/")
+WEBHOOK_SECRET          = os.environ.get("WEBHOOK_SECRET", "geheim")
 
-# Produkte als Env-Var im Format:
-#   BUY_PRODUCTS=Name1|Preis1|Datei1|Beschreibung1,Name2|Preis2|Datei2|Beschreibung2
-# Beispiel:
-#   BUY_PRODUCTS=Starter|5000|files/starter.txt|Das Einsteiger-Paket,VIP|50000|files/vip.zip|Exklusive Inhalte
 def _parse_products() -> list[dict]:
     raw = os.environ.get("BUY_PRODUCTS", "")
     products = []
@@ -38,8 +35,6 @@ def _parse_products() -> list[dict]:
     return products
 
 PRODUCTS = _parse_products()
-
-# TicketTool Bot-IDs (weiße & Premium Version)
 TICKETTOOL_BOT_IDS = [557628352828014614, 903654348561137665]
 
 # ============================================================
@@ -64,8 +59,7 @@ async def is_matching_ticket(channel: discord.TextChannel, keyword: str) -> bool
             if embed.description and kw in embed.description.lower(): return True
             if embed.footer and embed.footer.text and kw in embed.footer.text.lower(): return True
             for field in embed.fields:
-                if kw in field.name.lower() or kw in field.value.lower():
-                    return True
+                if kw in field.name.lower() or kw in field.value.lower(): return True
     return False
 
 
@@ -78,44 +72,46 @@ def has_allowed_role(member: discord.Member) -> bool:
 async def get_minecraft_uuid(username: str) -> str | None:
     url = f"https://api.mojang.com/users/profiles/minecraft/{username}"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status == 200:
-                    data = await r.json()
-                    return data.get("id")
+                    return (await r.json()).get("id")
     except Exception as e:
         print(f"[UUID-Fehler] {e}")
     return None
 
 
-async def check_hugosmp_payments(username: str) -> float:
-    """
-    Prüft Zahlungen auf HugoSMP in den letzten 24h.
-    Passe die URL an sobald du den echten API-Endpunkt kennst.
-    """
-    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    endpoints = [
-        f"https://hugosmp.net/api/payments?player={username}&to={TARGET_MINECRAFT_PLAYER}&since={since}",
-        f"https://api.hugosmp.net/economy/transactions?from={username}&to={TARGET_MINECRAFT_PLAYER}",
-    ]
-    async with aiohttp.ClientSession() as session:
-        for url in endpoints:
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        total = 0.0
-                        if isinstance(data, list):
-                            for tx in data:
-                                total += float(tx.get("amount", tx.get("money", 0)))
-                        elif isinstance(data, dict):
-                            total = float(data.get("total", data.get("amount", data.get("sum", 0))))
-                        if total > 0:
-                            return total
-            except Exception as e:
-                print(f"[HugoSMP API Fehler] {url}: {e}")
-    print(f"[WARN] Kein HugoSMP-Endpunkt erreichbar für {username}")
+async def api_query(sender: str) -> float:
+    """Fragt die Render-API: Wie viel hat 'sender' in 24h unverbraucht gezahlt?"""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{API_URL}/query",
+                json={"sender": sender, "secret": WEBHOOK_SECRET},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return float(data.get("total", 0))
+                print(f"[API query] HTTP {r.status}")
+    except Exception as e:
+        print(f"[API query Fehler] {e}")
     return 0.0
+
+
+async def api_claim(sender: str, min_amount: float) -> bool:
+    """Markiert Zahlungen als verbraucht damit sie nicht nochmal genutzt werden."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{API_URL}/claim",
+                json={"sender": sender, "min_amount": min_amount, "secret": WEBHOOK_SECRET},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                return r.status == 200
+    except Exception as e:
+        print(f"[API claim Fehler] {e}")
+    return False
 
 
 async def send_log(guild: discord.Guild, mc_name: str, amount: float,
@@ -128,16 +124,13 @@ async def send_log(guild: discord.Guild, mc_name: str, amount: float,
     color  = discord.Color.green() if success else discord.Color.red()
     status = "✅ Bestätigt" if success else "❌ Abgelehnt"
     label  = f"Buy ({product_name})" if product_name else "Free"
-    embed  = discord.Embed(
-        title=f"{label} Log — {status}",
-        color=color,
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.add_field(name="Minecraft Name",  value=mc_name,              inline=True)
-    embed.add_field(name="Gezahlter Betrag",value=f"${amount:,.0f}",    inline=True)
+    embed  = discord.Embed(title=f"{label} Log — {status}", color=color,
+                           timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Minecraft Name",   value=mc_name,           inline=True)
+    embed.add_field(name="Gezahlter Betrag", value=f"${amount:,.0f}", inline=True)
     if product_name:
-        embed.add_field(name="Produkt",     value=product_name,         inline=True)
-    embed.add_field(name="Empfänger",       value=TARGET_MINECRAFT_PLAYER, inline=True)
+        embed.add_field(name="Produkt", value=product_name, inline=True)
+    embed.add_field(name="Empfänger", value=TARGET_MINECRAFT_PLAYER,  inline=True)
     await channel.send(embed=embed)
 
 
@@ -147,67 +140,46 @@ async def send_log(guild: discord.Guild, mc_name: str, amount: float,
 
 @bot.command(name="free")
 async def free_command(ctx: commands.Context):
-    if not isinstance(ctx.channel, discord.TextChannel):
-        return
-
+    if not isinstance(ctx.channel, discord.TextChannel): return
     if not has_allowed_role(ctx.author):
-        await ctx.send("❌ Du hast keine Berechtigung für diesen Befehl.", delete_after=10)
-        return
-
+        await ctx.send("❌ Du hast keine Berechtigung.", delete_after=10); return
     async with ctx.typing():
-        ticket_match = await is_matching_ticket(ctx.channel, TICKET_KEYWORD)
-
-    if not ticket_match:
-        await ctx.send(
-            f"❌ Dieser Befehl funktioniert nur in **{TICKET_KEYWORD.capitalize()}-Tickets**.",
-            delete_after=10
-        )
-        return
-
+        match = await is_matching_ticket(ctx.channel, TICKET_KEYWORD)
+    if not match:
+        await ctx.send(f"❌ Nur in **{TICKET_KEYWORD}-Tickets** nutzbar.", delete_after=10); return
     missing = [f for f in FILES_TO_SEND if not os.path.isfile(f)]
     if missing:
-        await ctx.send(
-            f"⚠️ Folgende Dateien wurden nicht gefunden: `{'`, `'.join(missing)}`",
-            delete_after=15
-        )
-        return
-
+        await ctx.send(f"⚠️ Dateien fehlen: `{'`, `'.join(missing)}`", delete_after=15); return
     try:
         files = [discord.File(f) for f in FILES_TO_SEND]
         await ctx.send(FREE_MESSAGE, files=files)
-        print(f"📤 {FILES_TO_SEND} gesendet in #{ctx.channel.name} von {ctx.author}")
     except Exception as e:
-        await ctx.send("❌ Beim Senden der Dateien ist ein Fehler aufgetreten.")
-        print(f"❌ Fehler: {e}")
+        await ctx.send("❌ Fehler beim Senden."); print(f"!free Fehler: {e}")
 
 
 @free_command.error
-async def free_error(ctx: commands.Context, error):
-    print(f"Fehler bei !free: {error}")
+async def free_error(ctx, error): print(f"!free error: {error}")
 
 
 # ============================================================
-#  !buy  —  Embed mit MC-Name, Produkt-Dropdown & Prüfen-Button
+#  !buy — Embed mit MC-Name, Dropdown, Prüfen-Button
 # ============================================================
 
 class MCNameModal(discord.ui.Modal, title="✏️ Minecraft-Name eingeben"):
     mc_name = discord.ui.TextInput(
         label="Dein Minecraft Username",
         placeholder="z.B. Notch",
-        min_length=3,
-        max_length=16,
-        required=True,
+        min_length=3, max_length=16, required=True,
     )
 
-    def __init__(self, parent_view: "BuyView"):
+    def __init__(self, parent: "BuyView"):
         super().__init__()
-        self.parent_view = parent_view
+        self.parent = parent
 
     async def on_submit(self, interaction: discord.Interaction):
-        self.parent_view.mc_username = self.mc_name.value.strip()
+        self.parent.mc_username = self.mc_name.value.strip()
         await interaction.response.send_message(
-            f"✅ Minecraft-Name gesetzt: **`{self.parent_view.mc_username}`**\n"
-            f"Wähle jetzt ein Produkt und klicke auf **✅ Prüfen**.",
+            f"✅ Name gesetzt: **`{self.parent.mc_username}`** — wähle jetzt ein Produkt und klicke **✅ Prüfen**.",
             ephemeral=True
         )
 
@@ -215,11 +187,10 @@ class MCNameModal(discord.ui.Modal, title="✏️ Minecraft-Name eingeben"):
 class BuyView(discord.ui.View):
     def __init__(self, channel: discord.TextChannel):
         super().__init__(timeout=600)
-        self.channel      = channel
-        self.mc_username  = ""
+        self.channel          = channel
+        self.mc_username      = ""
         self.selected_product: dict | None = None
 
-        # Dropdown aus PRODUCTS bauen
         if PRODUCTS:
             options = [
                 discord.SelectOption(
@@ -229,38 +200,24 @@ class BuyView(discord.ui.View):
                 )
                 for i, p in enumerate(PRODUCTS)
             ]
-            select = discord.ui.Select(
-                placeholder="📦 Produkt auswählen...",
-                options=options,
-                row=1
-            )
-            select.callback = self._product_selected
-            self.add_item(select)
+            sel = discord.ui.Select(placeholder="📦 Produkt auswählen...", options=options, row=1)
+            sel.callback = self._on_select
+            self.add_item(sel)
 
-    # ── MC-Name Button ──
     @discord.ui.button(label="✏️ Minecraft-Name eingeben", style=discord.ButtonStyle.secondary, row=2)
-    async def enter_name_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def name_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(MCNameModal(self))
 
-    # ── Dropdown Callback ──
-    async def _product_selected(self, interaction: discord.Interaction):
-        idx = int(interaction.data["values"][0])
-        self.selected_product = PRODUCTS[idx]
+    async def _on_select(self, interaction: discord.Interaction):
+        self.selected_product = PRODUCTS[int(interaction.data["values"][0])]
         await interaction.response.defer()
 
-    # ── Prüfen Button ──
     @discord.ui.button(label="✅ Prüfen", style=discord.ButtonStyle.green, row=3)
     async def check_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.mc_username:
-            await interaction.response.send_message(
-                "❌ Bitte gib zuerst deinen Minecraft-Namen ein.", ephemeral=True
-            )
-            return
+            await interaction.response.send_message("❌ Bitte zuerst Minecraft-Namen eingeben.", ephemeral=True); return
         if not self.selected_product:
-            await interaction.response.send_message(
-                "❌ Bitte wähle zuerst ein Produkt aus.", ephemeral=True
-            )
-            return
+            await interaction.response.send_message("❌ Bitte zuerst ein Produkt auswählen.", ephemeral=True); return
 
         await interaction.response.defer(ephemeral=True)
         username = self.mc_username
@@ -269,141 +226,101 @@ class BuyView(discord.ui.View):
         # UUID prüfen
         uuid = await get_minecraft_uuid(username)
         if not uuid:
-            await interaction.followup.send(
-                f"❌ Minecraft-Name **`{username}`** nicht gefunden. Bitte überprüfe die Schreibweise.",
-                ephemeral=True
-            )
-            return
+            await interaction.followup.send(f"❌ **`{username}`** nicht gefunden.", ephemeral=True); return
 
-        # Warte-Nachricht
-        wait_embed = discord.Embed(
+        # Warte-Embed
+        wait = await self.channel.send(embed=discord.Embed(
             title="🔍 Überprüfe Zahlung...",
-            description=(
-                f"Prüfe ob **{username}** mindestens **${product['price']:,}** "
-                f"an **{TARGET_MINECRAFT_PLAYER}** in den letzten 24h gezahlt hat..."
-            ),
+            description=f"Prüfe ob **{username}** mindestens **${product['price']:,}** an **{TARGET_MINECRAFT_PLAYER}** gezahlt hat...",
             color=discord.Color.yellow()
-        )
-        wait_msg = await self.channel.send(embed=wait_embed)
-        total_paid = await check_hugosmp_payments(username)
-        await wait_msg.delete()
+        ))
 
-        if total_paid >= product["price"]:
-            # ── Erfolg ──
+        total = await api_query(username)
+        await wait.delete()
+
+        if total >= product["price"]:
+            # Zahlung als verbraucht markieren
+            await api_claim(username, product["price"])
+
             embed = discord.Embed(
                 title="✅ Zahlung bestätigt!",
                 description=(
-                    f"**{username}** hat **${total_paid:,.0f}** an "
-                    f"**{TARGET_MINECRAFT_PLAYER}** gezahlt.\n"
-                    f"Mindestbetrag für **{product['name']}**: **${product['price']:,}** ✅\n\n"
-                    f"Hier ist deine Datei:"
+                    f"**{username}** hat **${total:,.0f}** an **{TARGET_MINECRAFT_PLAYER}** gezahlt.\n"
+                    f"Mindestbetrag: **${product['price']:,}** ✅\n\nHier ist deine Datei:"
                 ),
                 color=discord.Color.green(),
                 timestamp=datetime.now(timezone.utc)
             )
-            embed.add_field(name="Produkt", value=product["name"],          inline=True)
-            embed.add_field(name="Preis",   value=f"${product['price']:,}", inline=True)
-            embed.add_field(name="Gezahlt", value=f"${total_paid:,.0f}",    inline=True)
+            embed.add_field(name="Produkt", value=product["name"],           inline=True)
+            embed.add_field(name="Preis",   value=f"${product['price']:,}",  inline=True)
+            embed.add_field(name="Gezahlt", value=f"${total:,.0f}",          inline=True)
             embed.set_footer(text=f"Verifiziert für: {username}")
 
-            file_path = product["file"]
-            if os.path.exists(file_path):
-                await self.channel.send(embed=embed, file=discord.File(file_path))
+            if os.path.exists(product["file"]):
+                await self.channel.send(embed=embed, file=discord.File(product["file"]))
             else:
                 await self.channel.send(embed=embed)
-                await self.channel.send(
-                    f"⚠️ Produktdatei `{file_path}` nicht gefunden. Bitte Admin kontaktieren."
-                )
+                await self.channel.send(f"⚠️ Datei `{product['file']}` fehlt — Admin kontaktieren.")
 
-            await send_log(interaction.guild, username, total_paid, True, product["name"])
-            await interaction.followup.send("✅ Kauf erfolgreich verifiziert!", ephemeral=True)
+            await send_log(interaction.guild, username, total, True, product["name"])
+            await interaction.followup.send("✅ Erfolgreich verifiziert!", ephemeral=True)
 
-            # Alle Buttons deaktivieren
-            for child in self.children:
-                child.disabled = True
-            try:
-                await interaction.message.edit(view=self)
-            except Exception:
-                pass
+            for child in self.children: child.disabled = True
+            try: await interaction.message.edit(view=self)
+            except Exception: pass
 
         else:
-            # ── Nicht genug gezahlt ──
             embed = discord.Embed(
                 title="❌ Zahlung nicht ausreichend",
                 description=(
-                    f"**{username}** hat nur **${total_paid:,.0f}** von "
-                    f"**${product['price']:,}** für **{product['name']}** gezahlt.\n"
-                    f"Bitte zahle den korrekten Betrag an **{TARGET_MINECRAFT_PLAYER}** und versuche es erneut."
+                    f"**{username}** hat nur **${total:,.0f}** von **${product['price']:,}** gezahlt.\n"
+                    f"Bitte zahle den Betrag an **{TARGET_MINECRAFT_PLAYER}** und versuche es erneut."
                 ),
                 color=discord.Color.red(),
                 timestamp=datetime.now(timezone.utc)
             )
             embed.set_footer(text=f"Geprüft für: {username}")
             await self.channel.send(embed=embed)
-            await send_log(interaction.guild, username, total_paid, False, product["name"])
-            await interaction.followup.send("❌ Betrag nicht ausreichend.", ephemeral=True)
+            await send_log(interaction.guild, username, total, False, product["name"])
+            await interaction.followup.send("❌ Nicht genug gezahlt.", ephemeral=True)
 
 
 @bot.command(name="buy")
 async def buy_command(ctx: commands.Context):
-    if not isinstance(ctx.channel, discord.TextChannel):
-        return
-
+    if not isinstance(ctx.channel, discord.TextChannel): return
     if not has_allowed_role(ctx.author):
-        await ctx.send("❌ Du hast keine Berechtigung für diesen Befehl.", delete_after=10)
-        return
-
+        await ctx.send("❌ Du hast keine Berechtigung.", delete_after=10); return
     async with ctx.typing():
-        ticket_match = await is_matching_ticket(ctx.channel, BUY_TICKET_KEYWORD)
-
-    if not ticket_match:
-        await ctx.send(
-            f"❌ Dieser Befehl funktioniert nur in **{BUY_TICKET_KEYWORD.capitalize()}-Tickets**.",
-            delete_after=10
-        )
-        return
-
+        match = await is_matching_ticket(ctx.channel, BUY_TICKET_KEYWORD)
+    if not match:
+        await ctx.send(f"❌ Nur in **{BUY_TICKET_KEYWORD}-Tickets** nutzbar.", delete_after=10); return
     if not PRODUCTS:
-        await ctx.send(
-            "⚠️ Keine Produkte konfiguriert. Bitte setze die `BUY_PRODUCTS` Umgebungsvariable.",
-            delete_after=15
-        )
-        return
-
+        await ctx.send("⚠️ Keine Produkte konfiguriert (`BUY_PRODUCTS`).", delete_after=15); return
     if not TARGET_MINECRAFT_PLAYER:
-        await ctx.send(
-            "⚠️ Kein Zahlungsempfänger konfiguriert. Bitte setze `TARGET_MINECRAFT_PLAYER`.",
-            delete_after=15
-        )
-        return
+        await ctx.send("⚠️ `TARGET_MINECRAFT_PLAYER` nicht gesetzt.", delete_after=15); return
 
-    # Produktliste für Embed
     product_lines = "\n".join(
         f"**{p['name']}** — ${p['price']:,}" + (f"\n> {p['desc']}" if p["desc"] else "")
         for p in PRODUCTS
     )
-
     embed = discord.Embed(
         title="🛒 Shop",
         description=(
-            f"**1.** Klicke auf **✏️ Minecraft-Name eingeben** und gib deinen Namen ein.\n"
-            f"**2.** Wähle ein Produkt aus dem Dropdown.\n"
-            f"**3.** Klicke auf **✅ Prüfen** — der Bot prüft ob du in den letzten 24h "
-            f"den Produktpreis an **{TARGET_MINECRAFT_PLAYER}** gezahlt hast.\n\n"
-            f"**Verfügbare Produkte:**\n{product_lines}"
+            f"**1.** Klicke **✏️ Minecraft-Name eingeben**\n"
+            f"**2.** Wähle ein Produkt\n"
+            f"**3.** Klicke **✅ Prüfen** — der Bot prüft ob du den Betrag an "
+            f"**{TARGET_MINECRAFT_PLAYER}** gezahlt hast.\n\n"
+            f"**Produkte:**\n{product_lines}"
         ),
         color=discord.Color.gold(),
         timestamp=datetime.now(timezone.utc)
     )
     embed.set_footer(text="Shop System")
-
-    view = BuyView(ctx.channel)
-    await ctx.send(embed=embed, view=view)
+    await ctx.send(embed=embed, view=BuyView(ctx.channel))
 
 
 @buy_command.error
-async def buy_error(ctx: commands.Context, error):
-    print(f"Fehler bei !buy: {error}")
+async def buy_error(ctx, error): print(f"!buy error: {error}")
 
 
 # ============================================================
@@ -412,24 +329,19 @@ async def buy_error(ctx: commands.Context, error):
 
 @bot.event
 async def on_ready():
-    print(f"✅ Bot ist online als: {bot.user}")
-    print(f"   !free Keyword  : '{TICKET_KEYWORD}'")
-    print(f"   !free Dateien  : {FILES_TO_SEND}")
-    print(f"   !free Rollen   : {ALLOWED_ROLES if ALLOWED_ROLES else 'Alle'}")
-    print(f"   !buy  Keyword  : '{BUY_TICKET_KEYWORD}'")
-    print(f"   !buy  Empfänger: '{TARGET_MINECRAFT_PLAYER}'")
-    print(f"   !buy  Produkte : {len(PRODUCTS)}")
+    print(f"✅ {bot.user} online")
+    print(f"   API-URL         : {API_URL}")
+    print(f"   !free Keyword   : {TICKET_KEYWORD}")
+    print(f"   !buy  Keyword   : {BUY_TICKET_KEYWORD}")
+    print(f"   Empfänger       : {TARGET_MINECRAFT_PLAYER}")
+    print(f"   Produkte        : {len(PRODUCTS)}")
     for p in PRODUCTS:
-        exists = "✅" if os.path.exists(p["file"]) else "⚠️  DATEI FEHLT"
-        print(f"      • {p['name']} (${p['price']:,}) → {p['file']} {exists}")
+        ok = "✅" if os.path.exists(p["file"]) else "⚠️  FEHLT"
+        print(f"      • {p['name']} ${p['price']:,} → {p['file']} {ok}")
 
-
-# ============================================================
-#  Start
-# ============================================================
 
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        print("❌ Kein BOT_TOKEN gefunden! Setze die Umgebungsvariable auf Railway.")
+        print("❌ BOT_TOKEN fehlt!")
     else:
         bot.run(BOT_TOKEN)
