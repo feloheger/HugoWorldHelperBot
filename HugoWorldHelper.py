@@ -82,37 +82,40 @@ async def get_minecraft_uuid(username: str) -> str | None:
 
 
 async def api_query(sender: str) -> float:
-    """Fragt die Render-API: Wie viel hat 'sender' in 24h unverbraucht gezahlt?"""
+    headers = {"X-Secret": WEBHOOK_SECRET}
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(
                 f"{API_URL}/query",
-                json={"sender": sender, "secret": WEBHOOK_SECRET},
+                json={"sender": sender},
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as r:
                 if r.status == 200:
                     data = await r.json()
                     return float(data.get("total", 0))
-                print(f"[API query] HTTP {r.status}")
+                print(f"[API query] HTTP {r.status}: {await r.text()}")
     except Exception as e:
         print(f"[API query Fehler] {e}")
     return 0.0
 
 
 async def api_claim(sender: str, min_amount: float) -> bool:
-    """Markiert Zahlungen als verbraucht damit sie nicht nochmal genutzt werden."""
+    headers = {"X-Secret": WEBHOOK_SECRET}
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(
                 f"{API_URL}/claim",
-                json={"sender": sender, "min_amount": min_amount, "secret": WEBHOOK_SECRET},
+                json={"sender": sender, "min_amount": min_amount},
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as r:
+                if r.status != 200:
+                    print(f"[API claim] HTTP {r.status}: {await r.text()}")
                 return r.status == 200
     except Exception as e:
         print(f"[API claim Fehler] {e}")
     return False
-
 
 async def send_log(guild: discord.Guild, mc_name: str, amount: float,
                    success: bool, product_name: str = ""):
