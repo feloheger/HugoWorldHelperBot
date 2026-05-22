@@ -3,7 +3,33 @@ from discord.ext import commands
 import aiohttp
 import os
 from datetime import datetime, timezone
+import asyncio
 
+@bot.event
+async def on_ready():
+    print(f"✅ {bot.user} online")
+   print(f"✅ {bot.user} online")
+    print(f"   API-URL         : {API_URL}")
+    print(f"   !free Keyword   : {TICKET_KEYWORD}")
+    print(f"   !buy  Keyword   : {BUY_TICKET_KEYWORD}")
+    print(f"   Empfänger       : {TARGET_MINECRAFT_PLAYER}")
+    print(f"   Produkte        : {len(PRODUCTS)}")
+    for p in PRODUCTS:
+        ok = "✅" if os.path.exists(p["file"]) else "⚠️  FEHLT"
+        print(f"      • {p['name']} ${p['price']:,} → {p['file']} {ok}")
+
+    bot.loop.create_task(keep_alive_ping())
+
+async def keep_alive_ping():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(API_URL + "/", timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    print(f"[KeepAlive] Ping → {r.status}")
+        except Exception as e:
+            print(f"[KeepAlive] Fehler: {e}")
+        await asyncio.sleep(600)  # alle 10 Minuten
 # ============================================================
 #  CONFIG – Umgebungsvariablen (Railway)
 # ============================================================
