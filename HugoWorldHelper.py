@@ -1,35 +1,10 @@
 import discord
 from discord.ext import commands
 import aiohttp
+import asyncio
 import os
 from datetime import datetime, timezone
-import asyncio
 
-@bot.event
-async def on_ready():
-    print(f"✅ {bot.user} online")
-   print(f"✅ {bot.user} online")
-    print(f"   API-URL         : {API_URL}")
-    print(f"   !free Keyword   : {TICKET_KEYWORD}")
-    print(f"   !buy  Keyword   : {BUY_TICKET_KEYWORD}")
-    print(f"   Empfänger       : {TARGET_MINECRAFT_PLAYER}")
-    print(f"   Produkte        : {len(PRODUCTS)}")
-    for p in PRODUCTS:
-        ok = "✅" if os.path.exists(p["file"]) else "⚠️  FEHLT"
-        print(f"      • {p['name']} ${p['price']:,} → {p['file']} {ok}")
-
-    bot.loop.create_task(keep_alive_ping())
-
-async def keep_alive_ping():
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(API_URL + "/", timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    print(f"[KeepAlive] Ping → {r.status}")
-        except Exception as e:
-            print(f"[KeepAlive] Fehler: {e}")
-        await asyncio.sleep(600)  # alle 10 Minuten
 # ============================================================
 #  CONFIG – Umgebungsvariablen (Railway)
 # ============================================================
@@ -67,6 +42,22 @@ TICKETTOOL_BOT_IDS = [557628352828014614, 903654348561137665]
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# ============================================================
+#  KEEP ALIVE — hält Render wach (ping alle 10 Minuten)
+# ============================================================
+
+async def keep_alive_ping():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(API_URL + "/", timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    print(f"[KeepAlive] Ping → {r.status}")
+        except Exception as e:
+            print(f"[KeepAlive] Fehler: {e}")
+        await asyncio.sleep(600)  # alle 10 Minuten
 
 
 # ============================================================
@@ -108,40 +99,51 @@ async def get_minecraft_uuid(username: str) -> str | None:
 
 
 async def api_query(sender: str) -> float:
+    """Fragt die Render-API: Wie viel hat 'sender' in 24h unverbraucht gezahlt?"""
     headers = {"X-Secret": WEBHOOK_SECRET}
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"{API_URL}/query",
-                json={"sender": sender},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    return float(data.get("total", 0))
-                print(f"[API query] HTTP {r.status}: {await r.text()}")
-    except Exception as e:
-        print(f"[API query Fehler] {e}")
+    for versuch in range(3):  # 3 Versuche falls Render noch hochfährt
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    f"{API_URL}/query",
+                    json={"sender": sender},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=40)  # 40s für Render cold start
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        return float(data.get("total", 0))
+                    print(f"[API query] HTTP {r.status}: {await r.text()}")
+                    return 0.0
+        except Exception as e:
+            print(f"[API query Versuch {versuch + 1}/3] {e}")
+            if versuch < 2:
+                await asyncio.sleep(5)
     return 0.0
 
 
 async def api_claim(sender: str, min_amount: float) -> bool:
+    """Markiert Zahlungen als verbraucht damit sie nicht nochmal genutzt werden."""
     headers = {"X-Secret": WEBHOOK_SECRET}
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"{API_URL}/claim",
-                json={"sender": sender, "min_amount": min_amount},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                if r.status != 200:
+    for versuch in range(3):  # 3 Versuche falls Render noch hochfährt
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    f"{API_URL}/claim",
+                    json={"sender": sender, "min_amount": min_amount},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=40)  # 40s für Render cold start
+                ) as r:
+                    if r.status == 200:
+                        return True
                     print(f"[API claim] HTTP {r.status}: {await r.text()}")
-                return r.status == 200
-    except Exception as e:
-        print(f"[API claim Fehler] {e}")
+                    return False
+        except Exception as e:
+            print(f"[API claim Versuch {versuch + 1}/3] {e}")
+            if versuch < 2:
+                await asyncio.sleep(5)
     return False
+
 
 async def send_log(guild: discord.Guild, mc_name: str, amount: float,
                    success: bool, product_name: str = ""):
@@ -252,12 +254,10 @@ class BuyView(discord.ui.View):
         username = self.mc_username
         product  = self.selected_product
 
-        # UUID prüfen
         uuid = await get_minecraft_uuid(username)
         if not uuid:
             await interaction.followup.send(f"❌ **`{username}`** nicht gefunden.", ephemeral=True); return
 
-        # Warte-Embed
         wait = await self.channel.send(embed=discord.Embed(
             title="🔍 Überprüfe Zahlung...",
             description=f"Prüfe ob **{username}** mindestens **${product['price']:,}** an **{TARGET_MINECRAFT_PLAYER}** gezahlt hat...",
@@ -268,7 +268,6 @@ class BuyView(discord.ui.View):
         await wait.delete()
 
         if total >= product["price"]:
-            # Zahlung als verbraucht markieren
             await api_claim(username, product["price"])
 
             embed = discord.Embed(
@@ -367,6 +366,7 @@ async def on_ready():
     for p in PRODUCTS:
         ok = "✅" if os.path.exists(p["file"]) else "⚠️  FEHLT"
         print(f"      • {p['name']} ${p['price']:,} → {p['file']} {ok}")
+    bot.loop.create_task(keep_alive_ping())
 
 
 if __name__ == "__main__":
