@@ -15,6 +15,8 @@ FREE_MESSAGE   = os.environ.get("FREE_MESSAGE", "📁 Hier sind deine Dateien!")
 ALLOWED_ROLES  = [r.strip() for r in os.environ.get("ALLOWED_ROLES", "").split(",") if r.strip()]
 FILES_TO_SEND  = [f.strip() for f in os.environ.get("FILES_TO_SEND", "").split(",") if f.strip()]
 
+ADMIN_ROLES             = [r.strip() for r in os.environ.get("ADMIN_ROLES", "").split(",") if r.strip()]
+
 BUY_TICKET_KEYWORD      = os.environ.get("BUY_TICKET_KEYWORD", "buy")
 TARGET_MINECRAFT_PLAYER = os.environ.get("TARGET_MINECRAFT_PLAYER", "")
 LOG_CHANNEL_ID          = int(os.environ.get("LOG_CHANNEL_ID", "0"))
@@ -85,6 +87,12 @@ def has_allowed_role(member: discord.Member) -> bool:
         return True
     return any(role.name in ALLOWED_ROLES for role in member.roles)
 
+
+
+def has_admin_role(member: discord.Member) -> bool:
+    if not ADMIN_ROLES:
+        return any(role.name in ALLOWED_ROLES for role in member.roles) if ALLOWED_ROLES else True
+    return any(role.name in ADMIN_ROLES for role in member.roles)
 
 async def get_minecraft_uuid(username: str) -> str | None:
     url = f"https://api.mojang.com/users/profiles/minecraft/{username}"
@@ -351,6 +359,161 @@ async def buy_command(ctx: commands.Context):
 async def buy_error(ctx, error): print(f"!buy error: {error}")
 
 
+
+# ============================================================
+#  !showall — zeigt alle Zahlungen der letzten 24h
+# ============================================================
+
+async def api_showall() -> dict:
+    """Holt alle gespeicherten Zahlungen von der API."""
+    headers = {"X-Secret": WEBHOOK_SECRET}
+    for versuch in range(3):
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"{API_URL}/showall",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=40)
+                ) as r:
+                    if r.status == 200:
+                        return await r.json()
+                    print(f"[API showall] HTTP {r.status}: {await r.text()}")
+                    return {}
+        except Exception as e:
+            print(f"[API showall Versuch {versuch + 1}/3] {e}")
+            if versuch < 2:
+                await asyncio.sleep(5)
+    return {}
+
+
+async def api_reset(sender: str) -> bool:
+    """Setzt alle Zahlungen eines Senders zurück."""
+    headers = {"X-Secret": WEBHOOK_SECRET}
+    for versuch in range(3):
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    f"{API_URL}/reset",
+                    json={"sender": sender},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=40)
+                ) as r:
+                    if r.status == 200:
+                        return True
+                    print(f"[API reset] HTTP {r.status}: {await r.text()}")
+                    return False
+        except Exception as e:
+            print(f"[API reset Versuch {versuch + 1}/3] {e}")
+            if versuch < 2:
+                await asyncio.sleep(5)
+    return False
+
+
+@bot.command(name="showall")
+async def showall_command(ctx: commands.Context):
+    if not has_admin_role(ctx.author):
+        await ctx.send("❌ Du hast keine Berechtigung.", delete_after=10)
+        return
+
+    async with ctx.typing():
+        data = await api_showall()
+
+    if not data:
+        await ctx.send("📭 Keine Zahlungen in der Datenbank oder API nicht erreichbar.")
+        return
+
+    from datetime import datetime, timezone, timedelta
+    cutoff = datetime.now(timezone.utc).timestamp() - 86400
+
+    embed = discord.Embed(
+        title="💰 Alle Zahlungen (letzte 24h)",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    total_gesamt = 0
+    eintraege = 0
+
+    for sender, zahlungen in data.items():
+        aktive = [z for z in zahlungen if z["ts"] >= cutoff and not z["used"]]
+        alle_24h = [z for z in zahlungen if z["ts"] >= cutoff]
+        if not alle_24h:
+            continue
+
+        summe_aktiv = sum(z["amount"] for z in aktive)
+        summe_gesamt = sum(z["amount"] for z in alle_24h)
+        total_gesamt += summe_aktiv
+        eintraege += 1
+
+        zeilen = []
+        for z in alle_24h[-5:]:  # max 5 pro Sender
+            ts = datetime.fromtimestamp(z["ts"], tz=timezone.utc).strftime("%H:%M:%S")
+            status = "~~verbraucht~~" if z["used"] else "✅"
+            zeilen.append(f"`{ts}` ${z['amount']:,.2f} {status}")
+
+        embed.add_field(
+            name=f"👤 {sender} — ${summe_aktiv:,.0f} verfügbar",
+            value="
+".join(zeilen) or "—",
+            inline=False
+        )
+
+        if eintraege >= 20:  # Discord Embed max 25 fields
+            embed.add_field(name="...", value="Zu viele Einträge, nur erste 20 gezeigt.", inline=False)
+            break
+
+    if eintraege == 0:
+        await ctx.send("📭 Keine aktiven Zahlungen in den letzten 24h.")
+        return
+
+    embed.set_footer(text=f"Gesamt verfügbar: ${total_gesamt:,.0f} | {eintraege} Sender")
+    await ctx.send(embed=embed)
+
+
+@showall_command.error
+async def showall_error(ctx, error): print(f"!showall error: {error}")
+
+
+# ============================================================
+#  !reset <mc_name> — setzt Zahlungen eines Spielers zurück
+# ============================================================
+
+@bot.command(name="reset")
+async def reset_command(ctx: commands.Context, mc_name: str = ""):
+    if not has_admin_role(ctx.author):
+        await ctx.send("❌ Du hast keine Berechtigung.", delete_after=10)
+        return
+    if not mc_name:
+        await ctx.send("❌ Verwendung: `!reset <minecraft_name>`", delete_after=10)
+        return
+
+    async with ctx.typing():
+        success = await api_reset(mc_name)
+
+    if success:
+        embed = discord.Embed(
+            title="🔄 Reset erfolgreich",
+            description=f"Alle Zahlungen von **{mc_name}** wurden zurückgesetzt.",
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc)
+        )
+    else:
+        embed = discord.Embed(
+            title="❌ Reset fehlgeschlagen",
+            description=f"Zahlungen von **{mc_name}** konnten nicht zurückgesetzt werden.",
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc)
+        )
+    await ctx.send(embed=embed)
+
+
+@reset_command.error
+async def reset_error(ctx, error):
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("❌ Verwendung: `!reset <minecraft_name>`", delete_after=10)
+    print(f"!reset error: {error}")
+
+
 # ============================================================
 #  on_ready
 # ============================================================
@@ -374,3 +537,4 @@ if __name__ == "__main__":
         print("❌ BOT_TOKEN fehlt!")
     else:
         bot.run(BOT_TOKEN)
+
