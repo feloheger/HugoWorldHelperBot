@@ -453,8 +453,7 @@ async def showall_command(ctx: commands.Context):
 
         embed.add_field(
             name=f"👤 {sender} — ${summe_aktiv:,.0f} verfügbar",
-            value="
-".join(zeilen) or "—",
+            value="\n".join(zeilen) or "—",
             inline=False
         )
 
