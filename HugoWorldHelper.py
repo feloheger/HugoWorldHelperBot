@@ -4,6 +4,9 @@ import aiohttp
 import asyncio
 import os
 from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ============================================================
 #  CONFIG – Umgebungsvariablen (Railway)
@@ -536,4 +539,3 @@ if __name__ == "__main__":
         print("❌ BOT_TOKEN fehlt!")
     else:
         bot.run(BOT_TOKEN)
-
