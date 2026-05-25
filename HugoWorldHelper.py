@@ -440,8 +440,8 @@ async def showall_command(ctx: commands.Context):
         if not alle_24h:
             continue
 
-        summe_aktiv = sum(z["amount"] for z in aktive)
-        summe_gesamt = sum(z["amount"] for z in alle_24h)
+        summe_aktiv = sum(float(z["amount"]) for z in aktive)
+        summe_gesamt = sum(float(z["amount"]) for z in alle_24h)
         total_gesamt += summe_aktiv
         eintraege += 1
 
